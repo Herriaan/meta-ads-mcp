@@ -3,7 +3,7 @@
 import asyncio
 import json
 import logging
-from typing import Optional, Dict, Any, List, Union
+from typing import Optional, Dict, Any, List, Tuple, Union
 import io
 from PIL import Image as PILImage
 from mcp.server.fastmcp import Image
@@ -183,6 +183,26 @@ _ALL_ENHANCEMENT_KEYS: tuple[str, ...] = (
     "video_auto_crop",
     "video_highlights",
 )
+
+
+def _strip_deprecated_standard_enhancements(creative: Dict[str, Any]) -> None:
+    """Drop the deprecated standard_enhancements key from a creative dict in place.
+
+    Meta still emits `standard_enhancements` inside `creative_features_spec` on GET
+    responses but rejects it on POST with error_subcode 3858504. LLMs frequently copy
+    GET responses straight into the next mutation, so stripping it here prevents the
+    deprecated field from being re-introduced via the model.
+    """
+    if not isinstance(creative, dict):
+        return
+    cfs = creative.get("creative_features_spec")
+    if isinstance(cfs, dict):
+        cfs.pop("standard_enhancements", None)
+    dof = creative.get("degrees_of_freedom_spec")
+    if isinstance(dof, dict):
+        dof_cfs = dof.get("creative_features_spec")
+        if isinstance(dof_cfs, dict):
+            dof_cfs.pop("standard_enhancements", None)
 
 
 def _translate_video_customization_rules(
@@ -443,21 +463,21 @@ async def get_ads(account_id: str, access_token: Optional[str] = None, limit: in
     if adset_id:
         endpoint = f"{adset_id}/ads"
         params = {
-            "fields": "id,name,adset_id,campaign_id,status,creative,created_time,updated_time,bid_amount,conversion_domain,tracking_specs",
+            "fields": "id,name,adset_id,campaign_id,status,effective_status,issues_info,creative,created_time,updated_time,bid_amount,conversion_domain,tracking_specs",
             "limit": limit
         }
     # Use campaign-specific endpoint if campaign_id is provided
     elif campaign_id:
         endpoint = f"{campaign_id}/ads"
         params = {
-            "fields": "id,name,adset_id,campaign_id,status,creative,created_time,updated_time,bid_amount,conversion_domain,tracking_specs",
+            "fields": "id,name,adset_id,campaign_id,status,effective_status,issues_info,creative,created_time,updated_time,bid_amount,conversion_domain,tracking_specs",
             "limit": limit
         }
     else:
         # Default to account-level endpoint if no specific filters
         endpoint = f"{account_id}/ads"
         params = {
-            "fields": "id,name,adset_id,campaign_id,status,creative,created_time,updated_time,bid_amount,conversion_domain,tracking_specs",
+            "fields": "id,name,adset_id,campaign_id,status,effective_status,issues_info,creative,created_time,updated_time,bid_amount,conversion_domain,tracking_specs",
             "limit": limit
         }
 
@@ -481,7 +501,7 @@ async def get_ad_details(ad_id: str, access_token: Optional[str] = None) -> str:
         
     endpoint = f"{ad_id}"
     params = {
-        "fields": "id,name,adset_id,campaign_id,status,creative,created_time,updated_time,bid_amount,conversion_domain,tracking_specs,preview_shareable_link"
+        "fields": "id,name,adset_id,campaign_id,status,effective_status,issues_info,creative,created_time,updated_time,bid_amount,conversion_domain,tracking_specs,preview_shareable_link"
     }
     
     data = await make_api_request(endpoint, access_token, params)
@@ -535,6 +555,8 @@ async def get_creative_details(creative_id: str, access_token: Optional[str] = N
                         data["catalog_name"] = catalog["name"]
             except Exception:
                 pass  # Non-critical
+
+    _strip_deprecated_standard_enhancements(data)
 
     return json.dumps(data, indent=2)
 
@@ -685,6 +707,9 @@ async def get_ad_creatives(ad_id: str, access_token: Optional[str] = None) -> st
                 except Exception:
                     pass  # Non-critical
 
+        for creative in data['data']:
+            _strip_deprecated_standard_enhancements(creative)
+
     return json.dumps(data, indent=2)
 
 
@@ -692,12 +717,15 @@ async def get_ad_creatives(ad_id: str, access_token: Optional[str] = None) -> st
 @meta_api_tool
 async def get_ad_image(ad_id: str, access_token: Optional[str] = None) -> Image:
     """
-    Get, download, and visualize a Meta ad image in one step. Useful to see the image in the LLM.
-    
+    Get, download, and visualize the image attached to an existing Meta ad.
+
+    Takes a Meta ad ID and returns the image the ad is currently serving.
+    If all you have is an image hash (no ad), use get_image_by_hash instead.
+
     Args:
         ad_id: Meta Ads ad ID
         access_token: Meta API access token (optional - will use cached token if not provided)
-    
+
     Returns:
         The ad image ready for direct visual analysis
     """
@@ -834,58 +862,89 @@ async def get_ad_image(ad_id: str, access_token: Optional[str] = None) -> Image:
                 return f"Error processing image from direct URL: {str(e)}"
     
     print(f"Found image hashes: {image_hashes}")
-    
-    # Now fetch image data using adimages endpoint with specific format
+
+    return await _fetch_image_by_hash(account_id, image_hashes[0], access_token)
+
+
+@mcp_server.tool()
+@meta_api_tool
+async def get_image_by_hash(
+    account_id: str,
+    image_hash: str,
+    access_token: Optional[str] = None,
+) -> Image:
+    """
+    Get, download, and visualize a Meta ad image by its hash.
+
+    Use this when you have an image_hash without an ad — e.g. the hash
+    returned by upload_ad_image / bulk_upload_ad_images, or one referenced
+    in a creative (object_story_spec.link_data.image_hash, asset_feed_spec
+    images[].hash, etc.). To view the image of an existing ad, prefer
+    get_ad_image(ad_id).
+
+    Args:
+        account_id: Meta Ads account ID (act_XXXXXXXXX or bare numeric — both accepted)
+        image_hash: Meta image hash
+        access_token: Meta API access token (optional - will use cached token if not provided)
+
+    Returns:
+        The image ready for direct visual analysis
+    """
+    if not account_id:
+        return "Error: No account ID provided"
+    if not image_hash:
+        return "Error: No image hash provided"
+    normalized_account = ensure_act_prefix(account_id).removeprefix("act_")
+    return await _fetch_image_by_hash(normalized_account, image_hash, access_token)
+
+
+async def _fetch_image_by_hash(
+    account_id: str,
+    image_hash: str,
+    access_token: Optional[str],
+) -> Union[Image, str]:
+    """Fetch a single image from act_{account_id}/adimages by hash and return it as a PIL Image.
+
+    account_id is the bare numeric part (without the "act_" prefix). Returns
+    an "Error: ..." string on failure so the @meta_api_tool wrapper can
+    serialize it.
+    """
     image_endpoint = f"act_{account_id}/adimages"
-    
-    # Format the hashes parameter exactly as in our successful curl test
-    hashes_str = f'["{image_hashes[0]}"]'  # Format first hash only, as JSON string array
-    
+    hashes_str = f'["{image_hash}"]'
     image_params = {
         "fields": "hash,url,width,height,name,status",
-        "hashes": hashes_str
+        "hashes": hashes_str,
     }
-    
+
     print(f"Requesting image data with params: {image_params}")
     image_data = await make_api_request(image_endpoint, access_token, image_params)
-    
+
     if "error" in image_data:
         return f"Error: Failed to get image data - {json.dumps(image_data)}"
-    
+
     if "data" not in image_data or not image_data["data"]:
-        return "Error: No image data returned from API"
-    
-    # Get the first image URL
-    first_image = image_data["data"][0]
-    image_url = first_image.get("url")
-    
+        return (
+            f"Error: No image found for hash {image_hash} in account "
+            f"act_{account_id}. Confirm the hash and that the account matches "
+            "the one used to upload (image hashes are scoped per ad account)."
+        )
+
+    image_url = image_data["data"][0].get("url")
     if not image_url:
         return "Error: No valid image URL found"
-    
+
     print(f"Downloading image from URL: {image_url}")
-    
-    # Download the image
     image_bytes = await download_image(image_url)
-    
     if not image_bytes:
         return "Error: Failed to download image"
-    
+
     try:
-        # Convert bytes to PIL Image
         img = PILImage.open(io.BytesIO(image_bytes))
-        
-        # Convert to RGB if needed
         if img.mode != "RGB":
             img = img.convert("RGB")
-            
-        # Create a byte stream of the image data
         byte_arr = io.BytesIO()
         img.save(byte_arr, format="JPEG")
-        img_bytes = byte_arr.getvalue()
-        
-        # Return as an Image object that LLM can directly analyze
-        return Image(data=img_bytes, format="jpeg")
-        
+        return Image(data=byte_arr.getvalue(), format="jpeg")
     except Exception as e:
         return f"Error processing image: {str(e)}"
 
@@ -895,7 +954,15 @@ async def get_ad_image(ad_id: str, access_token: Optional[str] = None) -> Image:
 async def get_ad_video(ad_id: str = "", video_id: str = "", account_id: str = "", access_token: Optional[str] = None) -> str:
     """
     Get video details and source URL for a Meta ad video creative. Returns the video source URL
-    (direct download link), thumbnail URL, and metadata (title, description, duration).
+    (direct download link), thumbnail URL, processing status, and metadata (title, description,
+    duration).
+
+    Also useful for polling after bulk_upload_ad_videos: ``video_status`` is
+    ``"processing"`` while Meta is still transcoding and ``"ready"`` when the
+    real video frames (and a usable thumbnail) are available. Calling
+    create_ad_creative before status is "ready" returns an error because the
+    only thumbnail Meta returns during processing is a generic placeholder
+    that would be permanently stored on the creative.
 
     Provide either ad_id (to auto-extract the video from the ad creative) or video_id directly.
     Providing account_id is strongly recommended — it enables the advideos edge which works
@@ -940,7 +1007,7 @@ async def get_ad_video(ad_id: str = "", video_id: str = "", account_id: str = ""
                 "hint": "This ad may be an image ad. Use get_ad_image instead."
             }, indent=2)
 
-    video_fields = "source,title,description,length,picture,thumbnails,created_time"
+    video_fields = "source,title,description,length,picture,thumbnails,status,created_time"
 
     # Strategy 1: Try fetching via the ad account's advideos edge.
     # Direct GET /{video_id} fails for BM-shared tokens (error 100/33) and
@@ -979,10 +1046,34 @@ async def get_ad_video(ad_id: str = "", video_id: str = "", account_id: str = ""
     if "error" in video_data:
         return json.dumps({"error": f"Could not get video {video_id}", "details": video_data}, indent=2)
 
+    # Mirror the selection logic used by create_ad_creative's auto-fetch: the
+    # `thumbnails.data[0].uri` entry is the real frame Meta extracted, while
+    # `picture` can be the generic processing-state placeholder. Prefer the
+    # frame-derived URL when available so callers passing this thumbnail_url
+    # back into update_ad_creative / create_ad_creative get a real preview.
+    thumbs = (
+        video_data.get("thumbnails", {}).get("data", [])
+        if isinstance(video_data.get("thumbnails"), dict)
+        else []
+    )
+    thumbnail_url: Optional[str] = None
+    if thumbs and isinstance(thumbs[0], dict) and thumbs[0].get("uri"):
+        thumbnail_url = thumbs[0]["uri"]
+    else:
+        thumbnail_url = video_data.get("picture")
+
+    status_obj = video_data.get("status")
+    video_status: Optional[str] = None
+    if isinstance(status_obj, dict):
+        vs = status_obj.get("video_status")
+        if isinstance(vs, str):
+            video_status = vs
+
     result = {
         "video_id": video_id,
         "source_url": video_data.get("source"),
-        "thumbnail_url": video_data.get("picture"),
+        "thumbnail_url": thumbnail_url,
+        "video_status": video_status,
         "title": video_data.get("title"),
         "description": video_data.get("description"),
         "duration_seconds": video_data.get("length"),
@@ -994,6 +1085,14 @@ async def get_ad_video(ad_id: str = "", video_id: str = "", account_id: str = ""
 
     if not result["source_url"]:
         result["warning"] = "No source URL returned. The video may have been deleted or you may lack permissions."
+
+    if video_status == "processing":
+        # Make the processing state easy to spot — callers using this tool to
+        # poll readiness before create_ad_creative want a fast signal.
+        result["warning_processing"] = (
+            "Video is still being processed by Meta. The thumbnail_url above "
+            "may be a generic placeholder until processing completes."
+        )
 
     return json.dumps(result, indent=2)
 
@@ -1225,16 +1324,21 @@ async def upload_ad_image(
 ) -> str:
     """
     Upload an image to use in Meta Ads creatives.
-    
+
     Args:
         account_id: Meta Ads account ID (format: act_XXXXXXXXX)
         access_token: Meta API access token (optional - will use cached token if not provided)
         file: Data URL or raw base64 string of the image (e.g., "data:image/png;base64,iVBORw0KG...")
         image_url: Direct URL to an image to fetch and upload
         name: Optional name for the image (default: filename)
-    
+
     Returns:
-        JSON response with image details including hash for creative creation
+        JSON object with:
+          - image_hash: Pass this to create_ad_creative when building the ad,
+            or to get_image_by_hash to view the image later.
+          - images: List of {hash, url, width, height, name}. The url is a
+            Meta CDN link you can fetch directly to view the image — no need
+            to call any other tool right after upload.
     """
     # Check required parameters
     if not account_id:
@@ -1543,23 +1647,64 @@ def _normalize_text_variants(items: Optional[List[Any]]) -> Optional[List[Dict[s
     return out
 
 
-async def _fetch_video_thumbnail(vid_id: str, access_token: str) -> Optional[str]:
-    """Fetch a thumbnail URL for a Meta video. Returns None on any failure.
+async def _fetch_video_thumbnail_with_status(
+    vid_id: str, access_token: str
+) -> Tuple[Optional[str], Optional[str]]:
+    """Fetch a thumbnail URL for a Meta video and the video's processing status.
 
-    Prefers the pre-generated `thumbnails.data[0].uri` over `picture` because
-    `picture` can sometimes be a small placeholder while the thumbnails entry
-    is the actual generated frame Meta uses for video previews.
+    Returns ``(thumbnail_url, video_status)``:
+      - ``thumbnail_url`` is the best frame-derived URL we can find. Prefers
+        ``thumbnails.data[0].uri`` over ``picture`` because ``picture`` can be
+        Meta's generic processing-state placeholder while ``thumbnails`` is
+        empty (transcoding still in progress). When the video is still
+        processing AND no ``thumbnails`` entries exist, we return ``None`` for
+        the URL so the caller can either retry or surface a clear error
+        instead of persisting the placeholder onto the creative.
+      - ``video_status`` is Meta's ``status.video_status`` (``"processing"``,
+        ``"ready"``, ``"expired"``, ``"error"``) or ``None`` if Meta did not
+        return it.
+
+    Any exception is swallowed and reported as ``(None, None)`` — callers
+    treat that as "no thumbnail available", same as before.
     """
     try:
-        info = await make_api_request(vid_id, access_token, {"fields": "picture,thumbnails"})
-        if isinstance(info, dict):
-            thumbs = info.get("thumbnails", {}).get("data", [])
-            if thumbs and thumbs[0].get("uri"):
-                return thumbs[0]["uri"]
-            return info.get("picture") or None
+        info = await make_api_request(
+            vid_id, access_token, {"fields": "picture,thumbnails,status"}
+        )
+        if not isinstance(info, dict):
+            return (None, None)
+        status_obj = info.get("status")
+        video_status: Optional[str] = None
+        if isinstance(status_obj, dict):
+            vs = status_obj.get("video_status")
+            if isinstance(vs, str):
+                video_status = vs
+        thumbs = info.get("thumbnails", {}).get("data", []) if isinstance(info.get("thumbnails"), dict) else []
+        if thumbs and isinstance(thumbs[0], dict) and thumbs[0].get("uri"):
+            return (thumbs[0]["uri"], video_status)
+        # No thumbnails entry. `picture` is only trustworthy when the video
+        # is actually ready — otherwise Meta returns its own placeholder URL
+        # for the processing state, which would silently ship as the creative
+        # thumbnail and never get refreshed.
+        picture = info.get("picture")
+        if picture and (video_status is None or video_status == "ready"):
+            return (picture, video_status)
+        return (None, video_status)
     except Exception as e:
         logger.warning(f"Failed to auto-fetch thumbnail for video {vid_id}: {e}")
-    return None
+        return (None, None)
+
+
+async def _fetch_video_thumbnail(vid_id: str, access_token: str) -> Optional[str]:
+    """Backwards-compatible wrapper around :func:`_fetch_video_thumbnail_with_status`.
+
+    Kept for callers that only need the URL and treat ``None`` as "no
+    thumbnail available". New code should prefer the ``_with_status`` variant
+    so it can distinguish "video still processing" from "no thumbnail at all"
+    and surface a clear error to the user.
+    """
+    url, _status = await _fetch_video_thumbnail_with_status(vid_id, access_token)
+    return url
 
 
 @mcp_server.tool()
@@ -1604,13 +1749,19 @@ async def create_ad_creative(
     """
     Create a new ad creative using an uploaded image hash, video ID, or an existing post.
 
-    Supports five creative modes:
+    Supports six creative modes:
     - **Existing post**: Provide object_story_id (format: {page_id}_{post_id}) to promote an existing
       organic or published post. No image_hash or video_id required. Optionally combine with
       asset_customization_rules to attach a 9:16 video for Story/Reels placements.
     - **Simple image/video**: Single image_hash or video_id with object_story_spec
     - **Multi-variant copy**: Use plural text params (messages[], headlines[], descriptions[]) to test
       multiple text variants with a single image/video. No optimization_type or is_dynamic_creative needed.
+    - **Placement Asset Customization (dual-aspect, non-DC)**: Serve different aspect ratios per placement
+      on a STANDARD ad set without is_dynamic_creative and without the one-ad-per-ad-set cap. Set
+      optimization_type="PLACEMENT" and pass videos=[{video_id, label}, ...] (or images=[{image_hash,
+      label}, ...]) together with asset_customization_rules whose customization_spec references those
+      labels via video_label/image_label. Every label in the rules MUST appear on a videos[]/images[]
+      entry, or Meta returns error_subcode=1487390 ("Adcreative Create Failed").
     - **Dynamic Creative**: Multiple variants with dynamic_creative_spec (requires is_dynamic_creative on ad set)
     - **FLEX/DOF (Advantage+)**: Set optimization_type="DEGREES_OF_FREEDOM" for Meta to auto-optimize
       across all asset combinations without requiring is_dynamic_creative on the ad set
@@ -1657,7 +1808,18 @@ async def create_ad_creative(
                   that include instagram_actor_id are routed through asset_feed_spec so that
                   ad_formats=["SINGLE_VIDEO"] is always included in the API request.
         thumbnail_url: Thumbnail image URL for video creatives. Recommended when using video_id.
-                      Meta will auto-generate a thumbnail if not provided.
+                      Meta will auto-generate a thumbnail if not provided — Pipeboard
+                      will fetch the best available frame from the uploaded video.
+                      IMPORTANT: when the video was just uploaded via
+                      bulk_upload_ad_videos, Meta needs a few seconds to transcode
+                      it. If create_ad_creative is called before transcoding
+                      completes, the only thumbnail Meta returns is a generic
+                      processing-state placeholder, which would be permanently
+                      stored on the creative. In that case create_ad_creative
+                      returns an error with video_status: "processing" — wait
+                      a few seconds (poll with get_ad_video until video_status
+                      is "ready") and retry, or pass thumbnail_url explicitly
+                      (any public image URL works).
         optimization_type: Optional. Valid values:
                           - "DEGREES_OF_FREEDOM": FLEX (Advantage+) creatives where Meta auto-optimizes
                             across all asset combinations. At least one multi-variant asset field required.
@@ -1701,9 +1863,11 @@ async def create_ad_creative(
         asset_customization_rules: List of placement-specific asset overrides for asset_feed_spec.
         phone_number: Phone number for CALL_NOW call-to-action ads (click-to-call).
                      Required when call_to_action_type is CALL_NOW. Use E.164 format
-                     (e.g., "+18005551234"). The number is passed to Meta in
-                     call_to_action.value.phone_number. Common use case: geo-routed
-                     call ads with different phone numbers per ad set.
+                     (e.g., "+18005551234"). The number is sent to Meta as
+                     call_to_action.value.link = "tel:<phone_number>" (Meta v24
+                     rejects a literal "phone_number" key with code 100). Common
+                     use case: geo-routed call ads with different phone numbers
+                     per ad set.
         creative_features_spec: Advantage+ Creative feature opt-ins/opt-outs. Controls individual
                    creative enhancements like image_touchups, text_optimizations, inline_comment,
                    add_text_overlay, music, 3d_animation, etc. Each feature is a dict with
@@ -2039,18 +2203,51 @@ async def create_ad_creative(
 
         # Determine whether to use asset_feed_spec path:
         # - plural parameters (headlines/descriptions/messages/image_hashes), OR
-        # - optimization_type is set (FLEX creatives always use asset_feed_spec), OR
-        # - asset_customization_rules requires asset_feed_spec, OR
-        # - video_id + description: Meta's video_data rejects "description" directly,
-        #   so route through asset_feed_spec which supports descriptions for video ads
-        # - video_id + instagram_actor_id: Meta requires ad_formats=["SINGLE_VIDEO"] in
-        #   asset_feed_spec alongside instagram_user_id in object_story_spec — error 1443048
-        #   ("object_story_spec ill formed") occurs when asset_feed_spec is absent. Routing
-        #   through asset_feed_spec ensures ad_formats is automatically included.
+        # - optimization_type is set to one of the dynamic-creative modes
+        #   (DEGREES_OF_FREEDOM, PLACEMENT, ASSET_CUSTOMIZATION, LANGUAGE), OR
+        # - asset_customization_rules requires asset_feed_spec.
+        #
+        # NOTE: `optimization_type="REGULAR"` is a Meta-documented asset_feed_spec
+        # value meaning "no extra optimization on top of the spec", but callers
+        # also use it as a signal that they do NOT want a dynamic creative. With
+        # only single-variant inputs (one message, one headline, one video) the
+        # caller's intent is the plain `object_story_spec.video_data` shape, so
+        # we treat REGULAR as a no-op for routing and let the simple path render
+        # the creative. The value is dropped on the wire (we never send
+        # asset_feed_spec.optimization_type=REGULAR for a single-video creative).
+        #
+        # We do NOT route a single video + instagram_actor_id through asset_feed_spec.
+        # Per Meta's docs the canonical shape for a video creative with an Instagram
+        # identity is `object_story_spec.video_data` + `instagram_user_id` sibling, no
+        # asset_feed_spec. Routing every single-video creative through asset_feed_spec
+        # silently produces a "dynamic creative" that CTWA campaigns (OUTCOME_SALES /
+        # OUTCOME_ENGAGEMENT with destination=WHATSAPP) reject with
+        # `error_subcode 1885392` ("O objetivo da campanha nao e aceito pelo criativo
+        # dinamico"). The single-video path keeps the creative regular so it serves in
+        # CTWA, lead-gen, traffic, and engagement campaigns alike.
+        #
+        # `description` is also no longer a routing trigger. Meta's `video_data` schema
+        # does not carry a `description` field for a single-video creative, so when a
+        # caller passes `description` alongside a single video we drop it and surface a
+        # warning in the response (the caller's intent — video + IG + WhatsApp CTA — is
+        # what matters, not an unrenderable field). To attach descriptions to a video
+        # creative, pass `descriptions=[...]` (plural) or `optimization_type` to opt
+        # explicitly into the dynamic-creative path.
+        #
+        # Normalize REGULAR -> None so the rest of the function does not echo it
+        # into asset_feed_spec.optimization_type when asset_feed_spec is built for
+        # another reason (e.g. plural params).
+        if optimization_type == "REGULAR":
+            optimization_type = None
         use_asset_feed = bool(
             headlines or descriptions or messages or image_hashes or videos or images
-            or optimization_type or asset_customization_rules or (video_id and description)
-            or (video_id and instagram_actor_id)
+            or optimization_type or asset_customization_rules
+        )
+
+        # Track whether `description` was provided but cannot be rendered in the
+        # simple video_data path so we can warn the caller after the API call.
+        single_video_description_dropped = bool(
+            video_id and description and not use_asset_feed
         )
 
         # Track if this is a video creative
@@ -2063,10 +2260,31 @@ async def create_ad_creative(
         # ("Could not auto-fetch thumbnail for video None"). Per-video thumbnail
         # fetching for the videos[] loop is handled separately downstream.
         if video_id and not thumbnail_url:
-            fetched = await _fetch_video_thumbnail(video_id, access_token)
+            fetched, video_status = await _fetch_video_thumbnail_with_status(
+                video_id, access_token
+            )
             if fetched:
                 thumbnail_url = fetched
                 logger.info(f"Auto-fetched video thumbnail: {thumbnail_url[:80]}...")
+            elif video_status == "processing":
+                # Meta is still transcoding the video. `picture` at this point is
+                # a generic processing placeholder, not a real video frame — if
+                # we ship it the creative is permanently stuck with that
+                # placeholder even after Meta finishes processing. Fail fast with
+                # an actionable error so the caller can retry (typically takes a
+                # few seconds for short videos) or pass thumbnail_url explicitly.
+                return json.dumps({
+                    "error": (
+                        f"Video {video_id} is still being processed by Meta — no "
+                        "frame-derived thumbnail is available yet. The creative "
+                        "would otherwise be stored with a generic placeholder."
+                    ),
+                    "video_status": video_status,
+                    "suggestions": [
+                        "Wait a few seconds for Meta to finish processing (use get_ad_video to check status), then retry create_ad_creative.",
+                        "Or pass thumbnail_url explicitly (any public image URL is accepted).",
+                    ],
+                }, indent=2)
             else:
                 logger.warning(f"Could not auto-fetch thumbnail for video {video_id}")
 
@@ -2097,7 +2315,14 @@ async def create_ad_creative(
                         if lead_gen_form_id:
                             cta_osi_value["lead_gen_form_id"] = lead_gen_form_id
                         if phone_number:
-                            cta_osi_value["phone_number"] = phone_number
+                            # CALL_NOW CTA: Meta v24 rejects a literal "phone_number"
+                            # key inside call_to_action.value with code 100
+                            # ("Invalid keys phone_number were found in param
+                            # call_to_action[value]"). The supported shape is
+                            # call_to_action.value.link = "tel:+<E.164 number>",
+                            # which overrides any website link_url already set
+                            # above (the headline still drives a tap-to-call).
+                            cta_osi_value["link"] = f"tel:{phone_number}"
                         asset_feed_spec_osi["call_to_actions"] = [
                             {"type": call_to_action_type, "value": cta_osi_value}
                         ]
@@ -2114,13 +2339,24 @@ async def create_ad_creative(
                 if lead_gen_form_id:
                     cta_osi_value["lead_gen_form_id"] = lead_gen_form_id
                 if phone_number:
-                    cta_osi_value["phone_number"] = phone_number
+                    # CALL_NOW: see note above — the supported shape is
+                    # call_to_action.value.link = "tel:+<E.164 number>",
+                    # not a "phone_number" key.
+                    cta_osi_value["link"] = f"tel:{phone_number}"
                 if cta_osi_value:
                     cta_osi["value"] = cta_osi_value
                 creative_data["call_to_action"] = cta_osi
 
             if instagram_actor_id:
-                creative_data["instagram_actor_id"] = instagram_actor_id
+                # Meta deprecated instagram_actor_id at POST /act_ID/adcreatives in
+                # Jan 2026 — sending it returns code 100 "Param instagram_actor_id
+                # must be a valid Instagram account id" verbatim. The replacement
+                # is the top-level instagram_user_id field on the AdCreative.
+                # For object_story_spec creatives the migration is handled below
+                # (instagram_user_id is nested inside object_story_spec); the
+                # object_story_id path has no object_story_spec, so the field
+                # lives at the top level.
+                creative_data["instagram_user_id"] = instagram_actor_id
 
         elif use_asset_feed:
             # Build the media array from the provided source
@@ -2135,10 +2371,15 @@ async def create_ad_creative(
                 # field of object_story_spec"). Parallel fetch via asyncio.gather to
                 # avoid N sequential round trips for N videos.
                 thumb_coros = [
-                    _fetch_video_thumbnail(str(v["video_id"]), access_token)
+                    _fetch_video_thumbnail_with_status(str(v["video_id"]), access_token)
                     for v in videos if not v.get("thumbnail_url")
                 ]
                 fetched_iter = iter(await asyncio.gather(*thumb_coros) if thumb_coros else [])
+                # Collect videos that are still transcoding so we can return one
+                # actionable error covering all of them — beats Meta's generic
+                # 1443226 ("specify image_hash or image_url") response and
+                # avoids persisting the placeholder picture on the creative.
+                still_processing: List[str] = []
                 videos_array = []
                 for v in videos:
                     vid_id = str(v["video_id"])
@@ -2146,13 +2387,17 @@ async def create_ad_creative(
                     if v.get("thumbnail_url"):
                         entry["thumbnail_url"] = v["thumbnail_url"]
                     else:
-                        fetched_thumb = next(fetched_iter, None)
+                        fetched_thumb, fetched_status = next(fetched_iter, (None, None))
                         if fetched_thumb:
                             entry["thumbnail_url"] = fetched_thumb
                             logger.info(
                                 f"Auto-fetched thumbnail for video {vid_id}: "
                                 f"{str(fetched_thumb)[:80]}..."
                             )
+                        elif fetched_status == "processing":
+                            still_processing.append(vid_id)
+                            # Skip emitting this entry — we'll bail out below.
+                            continue
                         else:
                             # Proceed without a thumbnail; Meta will return its own
                             # actionable error (1443226) if it actually requires one.
@@ -2165,6 +2410,21 @@ async def create_ad_creative(
                     elif v.get("adlabels"):
                         entry["adlabels"] = v["adlabels"]
                     videos_array.append(entry)
+
+                if still_processing:
+                    return json.dumps({
+                        "error": (
+                            "One or more videos are still being processed by "
+                            "Meta — no frame-derived thumbnails are available "
+                            "yet. The creative would otherwise be stored with "
+                            "generic processing placeholders."
+                        ),
+                        "video_ids_still_processing": still_processing,
+                        "suggestions": [
+                            "Wait a few seconds for Meta to finish processing (use get_ad_video to check status), then retry create_ad_creative.",
+                            "Or pass thumbnail_url explicitly inside each videos[] entry (any public image URL is accepted).",
+                        ],
+                    }, indent=2)
             elif video_id:
                 # Single video in asset_feed_spec uses "videos" key
                 videos_array = [{"video_id": video_id}]
@@ -2201,9 +2461,11 @@ async def create_ad_creative(
                     )
 
             # ------------------------------------------------------------------
-            # Build asset_feed_spec base: DOF vs non-DOF use different patterns.
+            # Build asset_feed_spec base: DOF vs non-DOF use different patterns,
+            # and DOF + video is a third case (link/CTA must be in asset_feed_spec,
+            # not object_story_spec.video_data).
             #
-            # DOF (DEGREES_OF_FREEDOM / FLEX / Advantage+):
+            # DOF (DEGREES_OF_FREEDOM / FLEX / Advantage+) + image:
             #   asset_feed_spec has ONLY: media, optimization_type, text variants.
             #   URL, ad_formats, and CTA go in object_story_spec.link_data.
             #   This matches the working Next.js duplication pattern — Meta's
@@ -2212,25 +2474,35 @@ async def create_ad_creative(
             #   Including those fields causes Meta to silently ignore
             #   asset_feed_spec for multi-image creatives.
             #
+            # DOF + video:
+            #   object_story_spec must be bare {page_id} (Meta v24 rejects
+            #   video_data anchor inside object_story_spec with error 1443048).
+            #   So link_urls, ad_formats, and call_to_action_types MUST live
+            #   in asset_feed_spec — otherwise Meta returns error_subcode
+            #   2061015 ("The link field is required"). Treated like the
+            #   non-DOF path below.
+            #
             # Non-DOF (regular Dynamic Creative):
             #   asset_feed_spec includes link_urls, ad_formats, call_to_action_types
             #   as before (this path is verified working).
             # ------------------------------------------------------------------
             is_dof = optimization_type == "DEGREES_OF_FREEDOM"
-            if is_dof:
-                # DOF: asset_feed_spec has ONLY media, optimization_type, text variants.
-                # URL, ad_formats, and CTA go in object_story_spec.link_data.
+            if is_dof and not is_video:
+                # DOF + image: asset_feed_spec has ONLY media, optimization_type,
+                # text variants. URL, ad_formats, and CTA go in object_story_spec.link_data.
                 asset_feed_spec = {"optimization_type": optimization_type}
                 # Only include ad_formats if explicitly provided by the caller
                 if ad_formats:
                     asset_feed_spec["ad_formats"] = ad_formats
             else:
-                # Non-DOF (including PLACEMENT): link_urls and ad_formats in asset_feed_spec.
+                # Non-DOF (any media) OR DOF + video: link_urls, ad_formats, and
+                # CTA live in asset_feed_spec, object_story_spec stays bare.
                 resolved_ad_formats = ad_formats or (["SINGLE_VIDEO"] if is_video else ["SINGLE_IMAGE"])
-                asset_feed_spec = {
-                    "link_urls": [{"website_url": link_url}],
-                    "ad_formats": resolved_ad_formats,
-                }
+                asset_feed_spec = {"ad_formats": resolved_ad_formats}
+                # Lead-gen flows can omit a website link_url (lead_gen_form_id
+                # provides the destination), so guard link_urls on link_url.
+                if link_url:
+                    asset_feed_spec["link_urls"] = [{"website_url": link_url}]
                 if optimization_type:
                     asset_feed_spec["optimization_type"] = optimization_type
 
@@ -2260,8 +2532,11 @@ async def create_ad_creative(
             elif message:
                 asset_feed_spec["bodies"] = [{"text": message}]
 
-            # CTA in asset_feed_spec only for non-DOF (DOF puts CTA in link_data)
-            if call_to_action_type and not is_dof:
+            # CTA in asset_feed_spec for:
+            #   - any non-DOF path (regular Dynamic Creative)
+            #   - DOF + video (object_story_spec is bare, so CTA must live here)
+            # DOF + image puts CTA in object_story_spec.link_data instead.
+            if call_to_action_type and (not is_dof or is_video):
                 if lead_gen_form_id or phone_number:
                     cta_value: Dict[str, Any] = {}
                     if link_url:
@@ -2269,7 +2544,10 @@ async def create_ad_creative(
                     if lead_gen_form_id:
                         cta_value["lead_gen_form_id"] = lead_gen_form_id
                     if phone_number:
-                        cta_value["phone_number"] = phone_number
+                        # CALL_NOW: Meta v24 supports only
+                        # call_to_action.value.link = "tel:+<E.164 number>"; a
+                        # literal "phone_number" key is rejected with code 100.
+                        cta_value["link"] = f"tel:{phone_number}"
                     asset_feed_spec["call_to_actions"] = [
                         {"type": call_to_action_type, "value": cta_value}
                     ]
@@ -2285,24 +2563,42 @@ async def create_ad_creative(
             # ------------------------------------------------------------------
             # Build object_story_spec for asset_feed_spec creatives.
             #
-            # When asset_feed_spec.videos[] carries the video, object_story_spec
-            # MUST contain only page_id (plus instagram_user_id, appended later).
-            # Adding a video_data anchor here triggers Meta API v24 error 1443048
-            # ("object_story_spec ill formed"). Per Meta's official docs, the
-            # canonical shape for asset_feed_spec.videos[] is bare page_id —
-            # the video, thumbnail, link URL, and CTA all live in
-            # asset_feed_spec.
+            # Three sub-cases:
+            #
+            # - Non-DOF (regular Dynamic Creative, PLACEMENT, etc.) — bare
+            #   {page_id}. Everything (link, CTA, media) lives in
+            #   asset_feed_spec. Verified working on v24.
+            #
+            # - DOF + video — object_story_spec MUST carry a `link_data.link`
+            #   anchor. Meta v24 rejects bare {page_id} for DOF + video with
+            #   error_subcode 2061015 ("The link field is required";
+            #   blame_field_specs=[["link"]]). A video_data anchor would trip
+            #   1443048 ("object_story_spec ill formed") instead, so we use a
+            #   minimal link_data: {link: <url>}. The video/thumbnail/text
+            #   variants stay in asset_feed_spec — this is verified via the
+            #   sandbox account (creative ids 3081153525608342, 1026522600054410
+            #   created 2026-05-27).
+            #
+            # - DOF + image — handled in the `else` branch below: full
+            #   link_data anchor with image_hash, link, CTA, etc.
+            #
             # Ref: https://developers.facebook.com/docs/marketing-api/dynamic-creative/dynamic-creative-optimization
             # ------------------------------------------------------------------
-            if video_id or not is_dof:
-                # video_id branch: asset_feed_spec.videos already carries the
-                # video + thumbnail; link_urls + call_to_action_types carry
-                # the destination + CTA. object_story_spec must be bare.
-                # Non-DOF image (PLACEMENT etc.) branch: same shape — URLs,
-                # images, CTA live exclusively in asset_feed_spec.
+            if is_video or not is_dof:
                 creative_data["object_story_spec"] = {
                     "page_id": page_id,
                 }
+                if is_dof and is_video:
+                    # Anchor link for Meta v24 DOF + video. Use link_url when
+                    # provided; fall back to the Meta lead-gen placeholder so
+                    # lead_gen_form_id flows still produce a non-empty anchor.
+                    anchor_link = link_url or (
+                        "http://fb.me/" if lead_gen_form_id else None
+                    )
+                    if anchor_link:
+                        creative_data["object_story_spec"]["link_data"] = {
+                            "link": anchor_link,
+                        }
             else:
                 # DOF image: link_data serves as the "anchor" creative template.
                 link_data = {}
@@ -2328,7 +2624,9 @@ async def create_ad_creative(
                     if lead_gen_form_id:
                         cta_value["lead_gen_form_id"] = lead_gen_form_id
                     if phone_number:
-                        cta_value["phone_number"] = phone_number
+                        # CALL_NOW: Meta v24 supports only
+                        # call_to_action.value.link = "tel:+<E.164 number>".
+                        cta_value["link"] = f"tel:{phone_number}"
                     if event_id and call_to_action_type in ("EVENT_RSVP", "BUY_TICKETS"):
                         cta_value["event_id"] = event_id
                     if cta_value:
@@ -2364,14 +2662,27 @@ async def create_ad_creative(
                 # Build call_to_action with the destination URL.
                 # For video creatives, link_url MUST go in call_to_action.value.link
                 # (not as a top-level field in video_data).
-                cta_value = {}
-                if link_url:
-                    cta_value["link"] = link_url
-                if lead_gen_form_id:
-                    cta_value["lead_gen_form_id"] = lead_gen_form_id
-                if phone_number:
-                    cta_value["phone_number"] = phone_number
                 cta_type = call_to_action_type or ("LEARN_MORE" if link_url else None)
+                cta_value = {}
+                if cta_type == "WHATSAPP_MESSAGE":
+                    # Click-to-WhatsApp: Meta derives the destination from the
+                    # Page's linked WhatsApp number, so the CTA carries no value.
+                    # Passing ANY extra parameter here (callers commonly send a
+                    # wa.me URL via link_url) makes Meta v24 reject the creative
+                    # with code 105 / error_subcode 1815630 ("Too many parameters
+                    # in Call To Action — Please remove parameter 'link' from the
+                    # value of WHATSAPP_MESSAGE call to action type"). The correct
+                    # shape is just {"type": "WHATSAPP_MESSAGE"} with no value.
+                    pass
+                else:
+                    if link_url:
+                        cta_value["link"] = link_url
+                    if lead_gen_form_id:
+                        cta_value["lead_gen_form_id"] = lead_gen_form_id
+                    if phone_number:
+                        # CALL_NOW: Meta v24 supports only
+                        # call_to_action.value.link = "tel:+<E.164 number>".
+                        cta_value["link"] = f"tel:{phone_number}"
                 if cta_type:
                     cta_data = {"type": cta_type}
                     if cta_value:
@@ -2434,7 +2745,12 @@ async def create_ad_creative(
                     if lead_gen_form_id:
                         cta_value["lead_gen_form_id"] = lead_gen_form_id
                     if phone_number:
-                        cta_value["phone_number"] = phone_number
+                        # CALL_NOW: Meta v24 supports only
+                        # call_to_action.value.link = "tel:+<E.164 number>";
+                        # the literal "phone_number" key is rejected with
+                        # code 100 ("Invalid keys phone_number were found in
+                        # param call_to_action[value]").
+                        cta_value["link"] = f"tel:{phone_number}"
                     if event_id and call_to_action_type in ("EVENT_RSVP", "BUY_TICKETS"):
                         cta_value["event_id"] = event_id
                     if cta_value:
@@ -2486,9 +2802,13 @@ async def create_ad_creative(
         # Make API request to create the creative
         data = await make_api_request(endpoint, access_token, creative_data, method="POST")
 
-        # Check for instagram_actor_id / instagram_user_id permission errors.
-        # This happens when the user's Meta access token lacks the instagram_basic
-        # permission. Re-connecting the Facebook account refreshes the token.
+        # Check for "Param instagram_actor_id must be a valid Instagram account id"
+        # error. This historically meant Meta could not validate the ID. Today (post
+        # Jan 2026) it is *also* what Meta returns when the deprecated
+        # instagram_actor_id field reaches their API, regardless of the ID being
+        # correct. We now translate instagram_actor_id -> instagram_user_id in
+        # every code path, so reaching this branch usually means the ID itself is
+        # not valid for this ad account (e.g. not connected, wrong type).
         if instagram_actor_id and "error" in data:
             err_details = data.get("error", {}).get("details", {})
             inner_msg = ""
@@ -2498,15 +2818,21 @@ async def create_ad_creative(
                     inner_msg = inner_err.get("message", "")
             if "valid Instagram account id" in inner_msg or "instagram_actor_id" in inner_msg.lower():
                 return json.dumps({
-                    "error": "Instagram account not authorized for advertising",
+                    "error": "Instagram account ID not accepted by Meta",
                     "explanation": (
-                        "The Meta API rejected the Instagram account ID. This usually means "
-                        "your Facebook access token is missing the 'instagram_basic' permission, "
-                        "which is required to use Instagram placements in ad creatives."
+                        "Meta rejected the Instagram account ID. The deprecated "
+                        "'instagram_actor_id' field has been translated to "
+                        "'instagram_user_id' in this request, so this most likely "
+                        "means the ID itself is not valid for this ad account — "
+                        "the Instagram account may not be linked to the Facebook "
+                        "page used by the creative, or the ID may belong to a "
+                        "different account."
                     ),
                     "fix": (
-                        "Reconnect your Facebook account at https://pipeboard.co/connections "
-                        "to refresh your access token with the required permissions."
+                        "Run get_instagram_accounts to list the Instagram accounts "
+                        "linked to this ad account and try one of those IDs, or "
+                        "verify in Meta Business Suite that the Instagram account "
+                        "is connected to the Facebook page used by the creative."
                     ),
                     "instagram_actor_id": instagram_actor_id,
                     "meta_error": inner_msg
@@ -2558,6 +2884,16 @@ async def create_ad_creative(
                     "discarded. Attach the creative to an ad set with "
                     "is_dynamic_creative=true, or use image_crops on a single "
                     "image_hash for per-placement cropping."
+                )
+            if single_video_description_dropped:
+                warnings_.append(
+                    "`description` was dropped because Meta's video_data schema does "
+                    "not carry a description field for a single-video creative. The "
+                    "creative was created with message + headline only. To attach a "
+                    "description to a video creative, pass `descriptions=[...]` "
+                    "(plural) or `optimization_type` — both route through "
+                    "asset_feed_spec, which is incompatible with CTWA campaigns "
+                    "(OUTCOME_SALES/OUTCOME_ENGAGEMENT with destination=WHATSAPP)."
                 )
             if warnings_:
                 result["warning"] = warnings_[0] if len(warnings_) == 1 else warnings_
