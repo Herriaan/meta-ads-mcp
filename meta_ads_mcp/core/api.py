@@ -8,9 +8,39 @@ import httpx
 import asyncio
 import functools
 import os
+from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 from . import auth
 from .auth import needs_authentication, auth_manager, start_callback_server, shutdown_callback_server
 from .utils import logger
+
+
+# Query-string params that must never leak to the caller in error payloads.
+# access_token is the operator credential; appsecret_proof is derived from
+# the app secret + access token via HMAC and is similarly sensitive.
+# See GHSA-9gw6-46qc-99vr.
+_SENSITIVE_QUERY_PARAMS = frozenset({"access_token", "appsecret_proof"})
+
+
+def _redact_url(url: str) -> str:
+    """Strip sensitive query params (access_token, appsecret_proof) from a URL.
+
+    Used to scrub Graph API URLs before they are returned to MCP callers in
+    error responses.
+    """
+    if not url:
+        return url
+    try:
+        parts = urlsplit(url)
+        if not parts.query:
+            return url
+        scrubbed = [
+            (k, "REDACTED" if k in _SENSITIVE_QUERY_PARAMS else v)
+            for k, v in parse_qsl(parts.query, keep_blank_values=True)
+        ]
+        return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(scrubbed), parts.fragment))
+    except Exception:
+        # Be conservative: if parsing fails, drop the query string entirely.
+        return url.split("?", 1)[0]
 
 class McpToolError(Exception):
     """Base class for MCP tool errors that must set isError: true.
@@ -41,22 +71,58 @@ logger.info(f"Graph API Version: {META_GRAPH_API_VERSION}")
 logger.info(f"META_APP_ID env var present: {'Yes' if os.environ.get('META_APP_ID') else 'No'}")
 logger.info(f"META_APP_SECRET env var present (appsecret_proof will be {'enabled' if os.environ.get('META_APP_SECRET') else 'disabled'})")
 
+def _is_account_disabled_error(error_code: Any, error_subcode: Any) -> bool:
+    """Return True when a Graph error indicates the ad account / action is
+    blocked by Meta policy rather than the token being invalid.
+
+    Currently covers:
+      - code 368: "The action attempted has been deemed abusive or is otherwise
+        disallowed." Token is still valid; the specific action was rejected.
+      - code 190 + subcode 459: user has been checkpointed by Facebook
+        security. Token is not expired; the user must clear the checkpoint on
+        Facebook before further calls succeed. Telling them to reconnect on
+        Pipeboard does not unblock them.
+
+    Other code 190 subcodes (458, 460, 463, 464, 467) are genuine session /
+    credential errors — keep the existing invalidate-token behavior for those.
+    """
+    if error_code == 368:
+        return True
+    if error_code == 190 and error_subcode == 459:
+        return True
+    return False
+
+
 class GraphAPIError(Exception):
     """Exception raised for errors from the Graph API."""
     def __init__(self, error_data: Dict[str, Any]):
         self.error_data = error_data
         self.message = error_data.get('message', 'Unknown Graph API error')
         super().__init__(self.message)
-        
+
         # Log error details
         logger.error(f"Graph API Error: {self.message}")
         logger.debug(f"Error details: {error_data}")
-        
+
+        code = error_data.get("code")
+        subcode = error_data.get("error_subcode")
+
         # Check if this is an auth error (code 4 is rate limiting, NOT auth)
-        if "code" in error_data and error_data["code"] in [190, 102]:
-            logger.warning(f"Auth error detected (code: {error_data['code']}). Invalidating token.")
-            auth_manager.invalidate_token()
-        elif "code" in error_data and error_data["code"] == 4:
+        if code in [190, 102]:
+            if _is_account_disabled_error(code, subcode):
+                logger.warning(
+                    f"Account/action policy block (code={code}, subcode={subcode}). "
+                    f"Token is still valid — NOT invalidating."
+                )
+            else:
+                logger.warning(f"Auth error detected (code: {code}). Invalidating token.")
+                auth_manager.invalidate_token()
+        elif code == 368:
+            logger.warning(
+                f"Action disallowed (code=368, subcode={subcode}). "
+                f"Token is still valid — NOT invalidating."
+            )
+        elif code == 4:
             logger.warning(f"Rate limit error detected (code: 4, subcode: {error_data.get('error_subcode', 'N/A')}). Token is still valid — NOT invalidating.")
 
 
@@ -228,15 +294,29 @@ async def make_api_request(
 
             # Check for rate limit errors vs authentication errors.
             # Code 4 is a rate limit (NOT auth) — do NOT invalidate token.
+            error_code = None
+            error_subcode = None
+            is_account_disabled = False
             if "error" in error_info:
                 error_obj = error_info.get("error", {})
-                error_code = error_obj.get("code") if isinstance(error_obj, dict) else None
+                if isinstance(error_obj, dict):
+                    error_code = error_obj.get("code")
+                    error_subcode = error_obj.get("error_subcode")
 
                 if error_code == 4:
                     # Application-level rate limit — token is still valid
                     logger.warning(
-                        f"Facebook API rate limit (code=4, subcode={error_obj.get('error_subcode', 'N/A')}, "
+                        f"Facebook API rate limit (code=4, subcode={error_subcode}, "
                         f"msg={error_obj.get('error_user_msg', error_obj.get('message', 'N/A'))}). "
+                        f"Token is still valid — NOT invalidating."
+                    )
+                elif _is_account_disabled_error(error_code, error_subcode):
+                    # Policy-side block (account or action). Token is still
+                    # valid; surface a distinct flag so callers can branch
+                    # without treating this as a stale-token reconnect.
+                    is_account_disabled = True
+                    logger.warning(
+                        f"Account/action policy block (code={error_code}, subcode={error_subcode}). "
                         f"Token is still valid — NOT invalidating."
                     )
                 elif error_code in [190, 102, 200, 10]:
@@ -258,25 +338,31 @@ async def make_api_request(
             elif e.response.status_code in [401, 403]:
                 logger.warning(f"Detected authentication error ({e.response.status_code})")
                 auth_manager.invalidate_token()
-            
-            # Include full details for technical users
+
+            # Include full details for technical users. URLs are scrubbed of
+            # access_token/appsecret_proof — see GHSA-9gw6-46qc-99vr.
             full_response = {
                 "headers": dict(e.response.headers),
                 "status_code": e.response.status_code,
-                "url": str(e.response.url),
+                "url": _redact_url(str(e.response.url)),
                 "reason": getattr(e.response, "reason_phrase", "Unknown reason"),
                 "request_method": e.request.method,
-                "request_url": str(e.request.url)
+                "request_url": _redact_url(str(e.request.url))
             }
-            
+
             # Return a properly structured error object
-            return {
-                "error": {
-                    "message": f"HTTP Error: {e.response.status_code}",
-                    "details": error_info,
-                    "full_response": full_response
-                }
+            error_payload: Dict[str, Any] = {
+                "message": f"HTTP Error: {e.response.status_code}",
+                "details": error_info,
+                "full_response": full_response,
             }
+            if is_account_disabled:
+                error_payload["is_account_disabled"] = True
+                if error_code is not None:
+                    error_payload["error_code"] = error_code
+                if error_subcode is not None:
+                    error_payload["error_subcode"] = error_subcode
+            return {"error": error_payload}
         
         except Exception as e:
             logger.error(f"Request Error: {str(e)}")
